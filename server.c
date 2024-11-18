@@ -6,173 +6,135 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <dirent.h>
-#include <errno.h>
-#include "http_message.h"
+#include "request.h"
 
-#define DEFAULT_PORT 8080
+#define DEFAULT_PORT 80
+#define STATIC_DIR "./static/"
 #define LISTEN_BACKLOG 5
-#define STATIC_DIR "./static"
 
-int total_requests = 0;
-int total_received_bytes = 0;
-int total_sent_bytes = 0;
+int request_count = 0;
+size_t bytes_received = 0;
+size_t bytes_sent = 0;
+pthread_mutex_t stats_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Helper function to send an HTTP response
-void send_response(int sock_fd, const char* status, const char* content_type, const char* body) {
-    char response[4096];
-    int content_length = body ? strlen(body) : 0;
-     snprintf(response, sizeof(response),
-             "HTTP/1.1 %s\r\n"
+void send_response(int fd, int status_code, const char* status_text, const char* content_type, const char* body) {
+    char header[1024];
+    snprintf(header, sizeof(header),
+             "HTTP/1.1 %d %s\r\n"
              "Content-Type: %s\r\n"
-             "Content-Length: %d\r\n"
-             "Connection: close\r\n"
-             "\r\n"
-             "%s",
-             status, content_type, content_length, body ? body : "");
-
-    write(sock_fd, response, strlen(response));
-    close(sock_fd);
+             "Content-Length: %zu\r\n\r\n",
+             status_code, status_text, content_type, strlen(body));
+    write(fd, header, strlen(header));
+    write(fd, body, strlen(body));
 }
 
-// Handle the /static route
-void handle_static(int sock_fd, const char* path) {
-    char filepath[1024];
-    snprintf(filepath, sizeof(filepath), "%s%s", STATIC_DIR, path + 7); // Skip "/static"
-    FILE* file = fopen(filepath, "rb");
+void handle_static(int fd, const char* path) {
+    char file_path[1024];
+    snprintf(file_path, sizeof(file_path), "%s%s", STATIC_DIR, path + 8); // Skip "/static/"
+
+    FILE* file = fopen(file_path, "rb");
     if (!file) {
-        send_response(sock_fd, "404 Not Found", "text/plain", "File not found");
+        send_response(fd, 404, "Not Found", "text/plain", "File not found");
         return;
     }
 
     fseek(file, 0, SEEK_END);
-    int file_size = ftell(file);
+    size_t file_size = ftell(file);
     fseek(file, 0, SEEK_SET);
 
     char* file_content = malloc(file_size);
     fread(file_content, 1, file_size, file);
     fclose(file);
 
-    char headers[256];
-    snprintf(headers, sizeof(headers),
+    char header[1024];
+    snprintf(header, sizeof(header),
              "HTTP/1.1 200 OK\r\n"
-             "Content-Length: %d\r\n"
-             "Content-Type: text/plain\r\n"
-             "Connection: close\r\n"
-             "\r\n",
+             "Content-Length: %zu\r\n\r\n",
              file_size);
-    write(sock_fd, headers, strlen(headers));
-    write(sock_fd, file_content, file_size);
+    write(fd, header, strlen(header));
+    write(fd, file_content, file_size);
 
-    total_sent_bytes += strlen(headers) + file_size;
     free(file_content);
 }
 
-// Handle the /stats route
-void handle_stats(int sock_fd) {
+void handle_stats(int fd) {
+    pthread_mutex_lock(&stats_mutex);
     char body[1024];
     snprintf(body, sizeof(body),
-             "<html><body><h1>Server Stats</h1>"
-             "<p>Total Requests: %d</p>"
-             "<p>Total Received Bytes: %d</p>"
-             "<p>Total Sent Bytes: %d</p></body></html>",
-             total_requests, total_received_bytes, total_sent_bytes);
-    send_response(sock_fd, "200 OK", "text/html", body);
+             "<html><body>"
+             "<h1>Server Stats</h1>"
+             "<p>Requests: %d</p>"
+             "<p>Bytes Received: %zu</p>"
+             "<p>Bytes Sent: %zu</p>"
+             "</body></html>",
+             request_count, bytes_received, bytes_sent);
+    pthread_mutex_unlock(&stats_mutex);
+
+    send_response(fd, 200, "OK", "text/html", body);
 }
 
-// Handle the /calc route
-void handle_calc(int sock_fd, const char* query) {
+void handle_calc(int fd, const char* path) {
     int a = 0, b = 0;
-    sscanf(query, "a=%d&b=%d", &a, &b);
-    char body[256];
-    snprintf(body, sizeof(body), "<html><body><h1>Calculation Result</h1><p>%d + %d = %d</p></body></html>", a, b, a + b);
-    send_response(sock_fd, "200 OK", "text/html", body);
+    sscanf(path, "/calc?a=%d&b=%d", &a, &b);
+    char body[1024];
+    snprintf(body, sizeof(body), "Result: %d", a + b);
+    send_response(fd, 200, "OK", "text/plain", body);
 }
 
-// Process HTTP request
-void process_request(int sock_fd, http_client_message_t* http_msg) {
-    total_requests++;
-    total_received_bytes += strlen(http_msg->method) + strlen(http_msg->path);
+void server_dispatch_request(Request* req, int fd) {
+    pthread_mutex_lock(&stats_mutex);
+    request_count++;
+    bytes_received += strlen(req->method) + strlen(req->path) + strlen(req->version);
+    pthread_mutex_unlock(&stats_mutex);
 
-    if (strncmp(http_msg->path, "/static", 7) == 0) {
-        handle_static(sock_fd, http_msg->path);
-    } else if (strncmp(http_msg->path, "/stats", 6) == 0) {
-        handle_stats(sock_fd);
-    } else if (strncmp(http_msg->path, "/calc", 5) == 0) {
-        char* query = strchr(http_msg->path, '?');
-        if (query) {
-            handle_calc(sock_fd, query + 1);
-        } else {
-            send_response(sock_fd, "400 Bad Request", "text/plain", "Missing query parameters");
-        }
+    if (strncmp(req->path, "/static", 7) == 0) {
+        handle_static(fd, req->path);
+    } else if (strcmp(req->path, "/stats") == 0) {
+        handle_stats(fd);
+    } else if (strncmp(req->path, "/calc", 5) == 0) {
+        handle_calc(fd, req->path);
     } else {
-        send_response(sock_fd, "404 Not Found", "text/plain", "Route not found");
+        send_response(fd, 404, "Not Found", "text/plain", "404 Not Found");
     }
 }
 
-// Thread function to handle a connection
-void handleConnection(int* sock_fd_ptr) {
-    int sock_fd = *sock_fd_ptr;
-    free(sock_fd_ptr);
+void* handle_connection(void* arg) {
+    int fd = *(int*)arg;
+    free(arg);
 
-    while (1) {
-        http_client_message_t* http_msg;
-        http_read_result_t result;
-
-        read_http_client_message(sock_fd, &http_msg, &result);
-        if (result == BAD_REQUEST) {
-            printf("Bad request\\n");
-            close(sock_fd);
-            break;
-        } else if (result == CLOSED_CONNECTION) {
-            printf("Closed connection\\n");
-            close(sock_fd);
-            break;
-        }
-
-        process_request(sock_fd, http_msg);
-        http_client_message_free(http_msg);
+    Request* req = request_read_from_fd(fd);
+    if (req) {
+        request_print(req);
+        server_dispatch_request(req, fd);
+        request_free(req);
     }
+    close(fd);
+    return NULL;
 }
 
-// Main function
 int main(int argc, char* argv[]) {
     int port = DEFAULT_PORT;
-    if (argc > 1 && strcmp(argv[1], "-p") == 0 && argc > 2) {
+    if (argc > 2 && strcmp(argv[1], "-p") == 0) {
         port = atoi(argv[2]);
     }
 
-    int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in server_addr = {0};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(port);
+    server_addr.sin_addr.s_addr = INADDR_ANY;
 
-    struct sockaddr_in socket_address;
-    memset(&socket_address, '\0', sizeof(socket_address));
-    socket_address.sin_family = AF_INET;
-    socket_address.sin_addr.s_addr = htonl(INADDR_ANY);
-    socket_address.sin_port = htons(port);
-
-    if (bind(socket_fd, (struct sockaddr*)&socket_address, sizeof(socket_address)) < 0) {
-        perror("bind");
-        exit(1);
-    }
-    if (listen(socket_fd, LISTEN_BACKLOG) < 0) {
-        perror("listen");
-        exit(1);
-    }
-
-    printf("Server is listening on port %d\\n", port);
+    bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr));
+    listen(server_fd, LISTEN_BACKLOG);
 
     while (1) {
+        int* client_fd = malloc(sizeof(int));
+        *client_fd = accept(server_fd, NULL, NULL);
         pthread_t thread;
-        int* client_fd_ptr = malloc(sizeof(int));
-        *client_fd_ptr = accept(socket_fd, NULL, NULL);
-        if (*client_fd_ptr < 0) {
-            perror("accept");
-            free(client_fd_ptr);
-            continue;
-        }
-        pthread_create(&thread, NULL, (void* (*)(void*))handleConnection, client_fd_ptr);
+        pthread_create(&thread, NULL, handle_connection, client_fd);
         pthread_detach(thread);
     }
 
+    close(server_fd);
     return 0;
 }
